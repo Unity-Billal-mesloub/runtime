@@ -95,6 +95,7 @@ enum class WasmValueType : unsigned;
 #ifdef DEBUG
 struct IndentStack;
 #endif
+struct ContinuationMember;
 
 class Lowering; // defined in lower.h
 
@@ -662,6 +663,12 @@ public:
                                                       // disqualify it from local copy prop.
 
     unsigned char lvIsEnumerator : 1; // Local is assigned exact class where : IEnumerable<T> via GDV
+
+    // The local is only ever read on the synchronous path of an async method, i.e. before
+    // the frame it belongs to has resumed. Suspension does not need to capture it: on
+    // resumption its value is either re-established (the resumed indicator is stored by
+    // the resumption path) or dead (the contexts are only read when not resumed).
+    unsigned char lvOnlyUsedOnSynchronousPath : 1;
 
 private:
     unsigned char lvIsNeverNegative : 1; // The local is known to be never negative
@@ -1831,7 +1838,6 @@ struct FuncInfoDsc
     jitstd::vector<WasmLocalsDecl>* funWasmLocalDecls;
     unsigned funWasmFrameSize;
     unsigned funWasmExnRefLocalIndex = UINT_MAX;
-    unsigned funWasmImageBaseLocalIndex = UINT_MAX;
     bool needsUnwindableFrame;
     emitLocation* startLoc;
     emitLocation* endLoc;
@@ -4406,6 +4412,16 @@ public:
 
     unsigned short asyncContextRestoreEHID = USHRT_MAX;
 
+    // IDs of every EH clause created by SaveAsyncContexts, both for this method and for
+    // all frames inlined into it. Maintained on the inline root, since an inlinee's
+    // clause survives inlining as a clause of the root. EH IDs are stable across
+    // inlining, so this stays valid after the tables are merged.
+    typedef JitHashTable<unsigned short, JitSmallPrimitiveKeyFuncs<unsigned short>, bool> AsyncContextRestoreEHIDSet;
+    AsyncContextRestoreEHIDSet* m_asyncContextRestoreEHIDs = nullptr;
+
+    bool ehIsAsyncContextRestore(unsigned short ehID);
+    bool ehIsInsideNonAsyncContextRestoreRegion(BasicBlock* block);
+
     unsigned lvaArg0Var = BAD_VAR_NUM; // The lclNum of arg0. Normally this will be info.compThisArg.
                          // However, if there is a "ldarga 0" or "starg 0" in the IL,
                          // we will redirect all "ldarg(a) 0" and "starg 0" to this temp.
@@ -4444,6 +4460,12 @@ public:
 
     // Variable representing async continuation argument passed.
     unsigned lvaAsyncContinuationArg = BAD_VAR_NUM;
+
+    // For async methods with CORINFO_ASYNC_SAVE_CONTEXTS: whether the body contains any
+    // async call, i.e. any point at which this method may suspend. Computed by
+    // SaveAsyncContexts. When false for an inlinee, its resumed indicator is provably
+    // always false and no post-inline async frame IR needs to be emitted for it.
+    bool compAsyncBodyMaySuspend = false;
 
 #if defined(DEBUG) && defined(TARGET_XARCH)
 
@@ -5306,9 +5328,17 @@ protected:
                                 unsigned                clsFlags,
                                 bool                    isReadonlyCall);
 
-    void impSetupAsyncCall(GenTreeCall* call, CORINFO_METHOD_HANDLE methHnd, OPCODE opcode, unsigned prefixFlags, NamedIntrinsic ni, const DebugInfo& callDI);
+    void impTryOptimizeAwaitAwaiter(GenTreeCall*              call,
+                                    CORINFO_RESOLVED_TOKEN*   pResolvedToken,
+                                    CORINFO_CALL_INFO*        callInfo,
+                                    CORINFO_METHOD_HANDLE*    methHnd,
+                                    CORINFO_CONTEXT_HANDLE*   exactContextHnd,
+                                    GenTree**                 instParam,
+                                    NamedIntrinsic            ni);
 
-    void impInsertAsyncArgsForLdvirtftnCall(GenTreeCall* call);
+    void impSetupAsyncCall(GenTreeCall* call, CORINFO_METHOD_HANDLE methHnd, OPCODE opcode, unsigned prefixFlags, NamedIntrinsic ni, const DebugInfo& callDI, bool* usesOwnContexts);
+
+    void impInsertAsyncArgsForLdvirtftnCall(GenTreeCall* call, bool usesOwnContexts);
     void impInheritAsyncContextsFromInliner(GenTreeCall* call);
 
     CORINFO_CLASS_HANDLE impGetSpecialIntrinsicExactReturnType(GenTreeCall* call);
@@ -5402,6 +5432,13 @@ protected:
 
     NamedIntrinsic lookupPrimitiveFloatNamedIntrinsic(CORINFO_METHOD_HANDLE method, const char* methodName);
     NamedIntrinsic lookupPrimitiveIntNamedIntrinsic(CORINFO_METHOD_HANDLE method, const char* methodName);
+    NamedIntrinsic lookupHalfNamedIntrinsic(CORINFO_METHOD_HANDLE method, const char* methodName);
+#if defined(FEATURE_HW_INTRINSICS) && (defined(TARGET_XARCH) || defined(TARGET_ARM64))
+    NamedIntrinsic lookupHalfIntrinsic(NamedIntrinsic ni);
+#endif // FEATURE_HW_INTRINSICS && (TARGET_XARCH || TARGET_ARM64)
+#if defined(FEATURE_HW_INTRINSICS) && defined(TARGET_XARCH)
+    int lookupHalfRoundingMode(NamedIntrinsic ni);
+#endif // FEATURE_HW_INTRINSICS && TARGET_XARCH
     GenTree* impUnsupportedNamedIntrinsic(unsigned              helper,
                                           CORINFO_METHOD_HANDLE method,
                                           CORINFO_SIG_INFO*     sig,
@@ -5419,6 +5456,7 @@ protected:
                                         CORINFO_SIG_INFO*     sig
                                         R2RARG(CORINFO_CONST_LOOKUP* entryPoint),
                                         bool                  mustExpand);
+    GenTree* impRotateHelper(var_types baseType, genTreeOps rotateOper);
 
 #ifdef FEATURE_HW_INTRINSICS
     bool IsValidForShuffle(GenTree* indices,
@@ -6296,6 +6334,12 @@ public:
     bool shouldAlignLoop(FlowGraphNaturalLoop* loop, BasicBlock* top);
     PhaseStatus placeLoopAlignInstructions();
 #endif
+
+    jitstd::vector<ContinuationMember>* m_asyncContinuationMembers = nullptr;
+    size_t GetContinuationMemberIndex(const ContinuationMember& member);
+    bool   TryGetContinuationMemberIndex(const ContinuationMember& member, size_t* index);
+    size_t GetContinuationMemberCount();
+    const ContinuationMember& GetContinuationMember(size_t index);
 
     PhaseStatus SaveAsyncContexts();
     void AddContextArgsToAsyncCalls(BasicBlock* block);
@@ -7536,6 +7580,9 @@ private:
 #endif // !FEATURE_FIXED_OUT_ARGS
 
     unsigned fgCheckInlineDepthAndRecursion(InlineInfo* inlineInfo);
+#ifdef DEBUG
+    void fgAsyncStressPrepare(unsigned depth);
+#endif // DEBUG
     bool IsDisallowedRecursiveInline(InlineContext* ancestor, InlineInfo* inlineInfo);
     bool ContextComplexityExceeds(CORINFO_CONTEXT_HANDLE handle, int max);
     bool MethodInstantiationComplexityExceeds(CORINFO_METHOD_HANDLE handle, int& cur, int max);
@@ -7546,6 +7593,9 @@ private:
     void fgInsertInlineeArgument(const InlArgInfo& argInfo, BasicBlock* block, Statement** afterStmt, Statement** newStmt, const DebugInfo& callDI);
     Statement* fgInlinePrependStatements(InlineInfo* inlineInfo);
     void fgInlineAppendStatements(InlineInfo* inlineInfo, BasicBlock* block, Statement* stmt);
+    void fgInlineAppendAsyncFrameStatements(InlineInfo* inlineInfo, BasicBlock* joinBlock);
+    void fgSetupAsyncFrameTransitionCall(GenTreeCall* call, const DebugInfo& di);
+    GenTree* gtNewContinuationMemberIndir(const struct ContinuationMember& member, var_types type);
 
 #ifdef DEBUG
     static fgWalkPreFn fgDebugCheckInlineCandidates;
@@ -11731,6 +11781,13 @@ public:
         return compStressCompile(STRESS_RANDOM_INLINE, 50);
     }
 
+    // Is general runtime async inlining being stressed, i.e. are async callees inlined
+    // with a decaying random probability? See AsyncStressPolicy.
+    static bool compAsyncInliningStress()
+    {
+        return JitConfig.JitStressAsyncInlining() != 0;
+    }
+
     bool compPromoteFewerStructs(unsigned lclNum);
 
 #endif // DEBUG
@@ -11965,6 +12022,14 @@ public:
     bool compIsAsyncVersion() const
     {
         return (info.compMethodInfo->options & CORINFO_ASYNC_VERSION) != 0;
+    }
+
+    // Is general inlining of runtime async calls enabled, i.e. inlining of async callees
+    // that may suspend? When disabled only the restricted cases are inlined: callees
+    // without any awaits, async versions of synchronous methods, and tail awaits.
+    static bool generalAsyncInliningEnabled()
+    {
+        return JitConfig.JitAsyncInlining() != 0;
     }
 
     //------------------------------------------------------------------------
